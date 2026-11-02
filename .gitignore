@@ -1,0 +1,4 @@
+bin/
+*.prg.debug.xml
+.vscode/
+__pycache__/
