@@ -8,7 +8,7 @@ A watch face for the Garmin Instinct 3 Solar, styled after the 1981 Game & Watch
 
 - Time in seven-segment digits.
 - Heart rate.
-- Day and date in Czech.
+- Day and date in English (two-letter day, then day and month).
 - Steps as the score, bottom right.
 - Step goal as the dive: the diver climbs down the rope from the boat, crosses the seabed and reaches the treasure chest when the goal is met. After that he keeps fetching gold.
 - Body Battery as spare divers on the boat.

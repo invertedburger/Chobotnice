@@ -17,7 +17,7 @@ import Toybox.WatchUi;
 // waves, goes back down. Reversed LCD colors.
 // Coordinates are designed for a 176x176 screen and scaled.
 class ChobotniceView extends WatchUi.WatchFace {
-    private const DAYS = ["NE", "PO", "ÚT", "ST", "ČT", "PÁ", "SO"];
+    private const DAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
     // 7-segment masks, bit 0 = a (top) ... bit 6 = g (middle).
     private const SEGMENTS = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F];
 
