@@ -49,12 +49,6 @@ class ChobotniceView extends WatchUi.WatchFace {
     // Ticks the diver spends cheering at the chest and waving on the boat.
     private const PAUSE = 3;
 
-    // The watch allows a partial redraw an average of 30 ms, display transfer
-    // included (measured on the watch: ~25 ms of it is the transfer). Our own
-    // code may use about a third; above that the tick gets longer.
-    private const OWN_MS_LIMIT = 10;
-    private const MAX_TICK = 4;
-
     private var _awake as Boolean = false;
     private var _scale as Float = 1.0;
     private var _sub as Array<Number> = [113, 0, 63, 63];
@@ -72,6 +66,9 @@ class ChobotniceView extends WatchUi.WatchFace {
     private var _legHits as Array<Array<Number>> = [];
     private var _diverBoxes as Array<Array<Number>> = [];
     private var _diverHits as Array<Array<Number>> = [];
+    // Tighter box and hits for a walking or carrying diver (no raised arms).
+    private var _walkBoxes as Array<Array<Number>> = [];
+    private var _walkHits as Array<Array<Number>> = [];
     // Precomputed so the per-tick redraws do no float math: design pixels
     // 0..40 scaled for the full-size (0) and on-deck (1) diver, the octopus
     // shapes, the rope, and dot offsets of unlit cells per radius.
@@ -95,18 +92,23 @@ class ChobotniceView extends WatchUi.WatchFace {
     private var _shownPos as Number = 0;
     private var _shownPose as Number = POSE_WALK;
     private var _shownDir as Number = 1;
+    private var _shownTick as Number = 0;
     private var _shownReach as Array<Number> = [0, 0, 0, 0];
 
     // State of the last full draw, reused by the partial redraws.
     private var _open as Boolean = false;
     private var _eyesToReader as Boolean = false;
     private var _spares as Number = 1;
-    // Seconds per animation tick in low power. Grows if redraws run long.
+    // Seconds between partial redraws in low power. Each redraws only the
+    // tentacles or only the diver (measured: ~12 and ~20 ms).
     private var _every as Number = 2;
     // Timing of the partial redraws since the last full redraw.
     private var _partials as Number = 0;
     private var _partialMs as Number = 0;
     private var _partialMax as Number = 0;
+    // Where the partial time goes (per minute): tentacle cells, diver.
+    private var _msArms as Number = 0;
+    private var _msDiver as Number = 0;
 
     function initialize() {
         WatchFace.initialize();
@@ -215,6 +217,7 @@ class ChobotniceView extends WatchUi.WatchFace {
         boxes.add([_sub[0], _sub[1], _sub[0] + _sub[2], _sub[1] + _sub[3]]);
         _legBoxes = [];
         _diverBoxes = [];
+        _walkBoxes = [];
         for (var i = 0; i < STOPS.size(); i++) {
             var x = s(STOPS[i][0]);
             var feet = s(STOPS[i][1]);
@@ -225,6 +228,7 @@ class ChobotniceView extends WatchUi.WatchFace {
             codes.add(CODE_DIVER + i);
             boxes.add(box);
             _diverBoxes.add(box);
+            _walkBoxes.add([box[0], feet - q[26], box[2], box[3]]);
             _legBoxes.add([x - q[8], feet - q[5], x + q[8], feet - 1]);
         }
 
@@ -238,9 +242,11 @@ class ChobotniceView extends WatchUi.WatchFace {
         }
         _legHits = [];
         _diverHits = [];
+        _walkHits = [];
         for (var i = 0; i < STOPS.size(); i++) {
             _legHits.add(hits(_legBoxes[i], codes, boxes));
             _diverHits.add(hits(_diverBoxes[i], codes, boxes));
+            _walkHits.add(hits(_walkBoxes[i], codes, boxes));
         }
     }
 
@@ -260,8 +266,9 @@ class ChobotniceView extends WatchUi.WatchFace {
         if (!_awake) {
             logPartials(clock);
         }
-        // One tick per second with the wrist up, slower in low power.
-        var tick = frame / (_awake ? 1 : _every);
+        // One tick per second with the wrist up; in low power the world moves
+        // every 4 s (the partial redraws split that into two 2 s steps).
+        var tick = _awake ? frame : frame / (2 * _every);
 
         dc.clearClip();
         dc.setColor(INK, PAPER);
@@ -273,7 +280,7 @@ class ChobotniceView extends WatchUi.WatchFace {
         var goal = info.stepGoal != null && info.stepGoal > 0 ? info.stepGoal : 10000;
         _open = steps >= goal;
         advance(tick);
-        showDiver();
+        showDiver(tick);
         for (var k = 0; k < 4; k++) {
             _shownReach[k] = reach(k, tick);
         }
@@ -289,51 +296,60 @@ class ChobotniceView extends WatchUi.WatchFace {
         drawTentacles(dc);
         drawOctopus(dc);
         for (var i = 0; i < STOPS.size(); i++) {
-            drawDiverAt(dc, i, tick);
+            drawDiverAt(dc, i);
         }
         drawFooter(dc, steps);
     }
 
-    // Low-power redraw between the full ones. The watch allows only a few
-    // milliseconds of drawing, so it acts only every `_every` seconds and then
-    // repaints a few small boxes: the one tentacle cell that changes this tick
-    // (the tentacles take turns, as on the original), and the diver, where he
-    // stands or, when he moves on, his old and new place. The tentacle is
-    // never put off, so the screen always shows what the diver dodges.
+    // Low-power redraw between the full ones. One world tick lasts 4 s and is
+    // shown in two steps, because one repaint costs about 10 ms: on the first
+    // the tentacles take their cell (the tentacles take turns, as on the
+    // original), on the second the diver moves, where he stands or, when he
+    // moves on, his old and new place. The diver decides on the tentacles
+    // already on the screen and one tick ahead, so he never dodges what the
+    // screen doesn't show.
     function onPartialUpdate(dc as Graphics.Dc) as Void {
         var frame = frameOf(System.getClockTime());
         if (frame % _every != 0) {
             return;
         }
         var started = System.getTimer();
-        var tick = frame / _every;
-        advance(tick);
-
-        // Bring the tentacles on screen up to date, a cell at a time.
-        for (var k = 0; k < 4; k++) {
-            var actual = reach(k, tick);
-            while (_shownReach[k] != actual) {
-                var shown = _shownReach[k];
-                _shownReach[k] = shown < actual ? shown + 1 : shown - 1;
-                var j = shown < actual ? shown : shown - 1;
-                repaint(dc, _cellBoxes[k][j], _cellHits[k][j], tick);
+        var step = frame / _every;
+        var tick = step / 2;
+        var t1 = started;
+        if (step % 2 == 0) {
+            // Bring the tentacles on screen up to date, a cell at a time.
+            for (var k = 0; k < 4; k++) {
+                var actual = reach(k, tick);
+                while (_shownReach[k] != actual) {
+                    var shown = _shownReach[k];
+                    _shownReach[k] = shown < actual ? shown + 1 : shown - 1;
+                    var j = shown < actual ? shown : shown - 1;
+                    repaint(dc, _cellBoxes[k][j], _cellHits[k][j]);
+                }
             }
-        }
-
-        if (_pos != _shownPos) {
-            var old = _shownPos;
-            showDiver();
-            repaint(dc, _diverBoxes[old], _diverHits[old], tick);
-            repaint(dc, _diverBoxes[_pos], _diverHits[_pos], tick);
+            t1 = System.getTimer();
+            _msArms += t1 - started;
         } else {
-            var pose = poseNow();
-            var legsOnly = pose == _shownPose && _dir == _shownDir && (pose == POSE_WALK || pose == POSE_CARRY);
-            showDiver();
-            if (legsOnly) {
-                repaint(dc, _legBoxes[_pos], _legHits[_pos], tick);
+            advance(tick);
+            if (_pos != _shownPos) {
+                var old = _shownPos;
+                var oldWalk = _shownPose == POSE_WALK || _shownPose == POSE_CARRY;
+                showDiver(tick);
+                var newWalk = _shownPose == POSE_WALK || _shownPose == POSE_CARRY;
+                repaint(dc, oldWalk ? _walkBoxes[old] : _diverBoxes[old], oldWalk ? _walkHits[old] : _diverHits[old]);
+                repaint(dc, newWalk ? _walkBoxes[_pos] : _diverBoxes[_pos], newWalk ? _walkHits[_pos] : _diverHits[_pos]);
             } else {
-                repaint(dc, _diverBoxes[_pos], _diverHits[_pos], tick);
+                var pose = poseNow();
+                var legsOnly = pose == _shownPose && _dir == _shownDir && (pose == POSE_WALK || pose == POSE_CARRY);
+                showDiver(tick);
+                if (legsOnly) {
+                    repaint(dc, _legBoxes[_pos], _legHits[_pos]);
+                } else {
+                    repaint(dc, _diverBoxes[_pos], _diverHits[_pos]);
+                }
             }
+            _msDiver += System.getTimer() - started;
         }
         dc.clearClip();
 
@@ -346,19 +362,18 @@ class ChobotniceView extends WatchUi.WatchFace {
     }
 
     // Writes how the partial redraws went since the last full one to the
-    // sideload log (Garmin\Apps\LOGS\CHOBOTNICE.TXT, if that file exists), and
-    // slows the tick down if they ran too long.
+    // sideload log (Garmin\Apps\LOGS\CHOBOTNICE.TXT, if that file exists).
     private function logPartials(clock as System.ClockTime) as Void {
         var avg = _partials > 0 ? _partialMs / _partials : 0;
-        if (avg > OWN_MS_LIMIT && _every < MAX_TICK) {
-            _every += 1;
-        }
         System.println(clock.hour.format("%02d") + ":" + clock.min.format("%02d")
             + " partials=" + _partials + " avg=" + avg + "ms max=" + _partialMax
-            + "ms tick=" + _every + "s budget=" + ($.budgetExceeded ? "EXCEEDED" : "ok"));
+            + "ms arms=" + _msArms + "ms diver=" + _msDiver + "ms"
+            + " tick=" + _every + "s budget=" + ($.budgetExceeded ? "EXCEEDED" : "ok"));
         _partials = 0;
         _partialMs = 0;
         _partialMax = 0;
+        _msArms = 0;
+        _msDiver = 0;
     }
 
     // ---- animation ------------------------------------------------------
@@ -461,14 +476,15 @@ class ChobotniceView extends WatchUi.WatchFace {
         return _bag ? POSE_CARRY : POSE_WALK;
     }
 
-    private function showDiver() as Void {
+    private function showDiver(tick as Number) as Void {
+        _shownTick = tick;
         _shownPos = _pos;
         _shownPose = poseNow();
         _shownDir = _dir;
     }
 
     // Clears one box and redraws the precomputed list of things overlapping it.
-    private function repaint(dc as Graphics.Dc, box as Array<Number>, codes as Array<Number>, tick as Number) as Void {
+    private function repaint(dc as Graphics.Dc, box as Array<Number>, codes as Array<Number>) as Void {
         var w = box[2] - box[0] + 1;
         var h = box[3] - box[1] + 1;
         dc.setClip(box[0], box[1], w, h);
@@ -494,7 +510,7 @@ class ChobotniceView extends WatchUi.WatchFace {
             } else if (code == CODE_OCTOPUS) {
                 drawOctopus(dc);
             } else {
-                drawDiverAt(dc, code - CODE_DIVER, tick);
+                drawDiverAt(dc, code - CODE_DIVER);
             }
         }
     }
@@ -674,13 +690,13 @@ class ChobotniceView extends WatchUi.WatchFace {
 
     // The diver at stop i if he is shown there, otherwise the faint helmet of
     // an unlit LCD cell.
-    private function drawDiverAt(dc as Graphics.Dc, i as Number, tick as Number) as Void {
+    private function drawDiverAt(dc as Graphics.Dc, i as Number) as Void {
         var x = s(STOPS[i][0]);
         var feet = s(STOPS[i][1]);
         // On deck the diver is drawn at the spares' size to clear the clock.
         var si = i == 0 ? 1 : 0;
         if (_shownPos == i) {
-            sprite(dc, x, feet, tick, si, _shownPose, _shownDir);
+            sprite(dc, x, feet, _shownTick, si, _shownPose, _shownDir);
         } else {
             var q = _px[si];
             ghost(dc, x, feet - q[19], q[6]);
